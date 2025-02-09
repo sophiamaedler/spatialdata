@@ -4,31 +4,26 @@ import filecmp
 import logging
 import os.path
 import re
+import sys
 import tempfile
+import traceback
 import warnings
 from collections.abc import Generator, Mapping, Sequence
 from contextlib import contextmanager
+from enum import Enum
 from functools import singledispatch
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
-import numpy as np
 import zarr
 from anndata import AnnData
-from anndata import read_zarr as read_anndata_zarr
-from anndata.experimental import read_elem
 from dask.array import Array as DaskArray
 from dask.dataframe import DataFrame as DaskDataFrame
-from datatree import DataTree
 from geopandas import GeoDataFrame
-from ome_zarr.format import Format
-from ome_zarr.writer import _get_valid_axes
-from xarray import DataArray
+from xarray import DataArray, DataTree
 
 from spatialdata._core.spatialdata import SpatialData
-from spatialdata._logging import logger
-from spatialdata._utils import iterate_pyramid_levels
-from spatialdata.models import TableModel
+from spatialdata._utils import get_pyramid_levels
 from spatialdata.models._utils import (
     MappingToCoordinateSystem_t,
     SpatialElement,
@@ -55,12 +50,12 @@ def ome_zarr_logger(level: Any) -> Generator[None, None, None]:
 
 
 def _get_transformations_from_ngff_dict(
-    list_of_encoded_ngff_transformations: list[dict[str, Any]]
+    list_of_encoded_ngff_transformations: list[dict[str, Any]],
 ) -> MappingToCoordinateSystem_t:
     list_of_ngff_transformations = [NgffBaseTransformation.from_dict(d) for d in list_of_encoded_ngff_transformations]
     list_of_transformations = [BaseTransformation.from_ngff(t) for t in list_of_ngff_transformations]
     transformations = {}
-    for ngff_t, t in zip(list_of_ngff_transformations, list_of_transformations):
+    for ngff_t, t in zip(list_of_ngff_transformations, list_of_transformations, strict=True):
         assert ngff_t.output_coordinate_system is not None
         transformations[ngff_t.output_coordinate_system.name] = t
     return transformations
@@ -112,39 +107,41 @@ def overwrite_coordinate_transformations_raster(
     group.attrs["multiscales"] = multiscales
 
 
+def overwrite_channel_names(group: zarr.Group, element: DataArray | DataTree) -> None:
+    """Write channel metadata to a group."""
+    if isinstance(element, DataArray):
+        channel_names = element.coords["c"].data.tolist()
+    else:
+        channel_names = element["scale0"]["image"].coords["c"].data.tolist()
+
+    channel_metadata = [{"label": name} for name in channel_names]
+    omero_meta = group.attrs["omero"]
+    omero_meta["channels"] = channel_metadata
+    group.attrs["omero"] = omero_meta
+    multiscales_meta = group.attrs["multiscales"]
+    if len(multiscales_meta) != 1:
+        raise ValueError(
+            f"Multiscale metadata must be of length one but got length {len(multiscales_meta)}. Data mightbe corrupted."
+        )
+    multiscales_meta[0]["metadata"]["omero"]["channels"] = channel_metadata
+    group.attrs["multiscales"] = multiscales_meta
+
+
 def _write_metadata(
     group: zarr.Group,
     group_type: str,
-    fmt: Format,
-    axes: str | list[str] | list[dict[str, str]] | None = None,
+    axes: list[str],
     attrs: Mapping[str, Any] | None = None,
 ) -> None:
     """Write metdata to a group."""
-    axes = _get_valid_axes(axes=axes, fmt=fmt)
+    axes = sorted(axes)
 
     group.attrs["encoding-type"] = group_type
     group.attrs["axes"] = axes
     # we write empty coordinateTransformations and then overwrite
     # them with overwrite_coordinate_transformations_non_raster()
     group.attrs["coordinateTransformations"] = []
-    # group.attrs["coordinateTransformations"] = coordinate_transformations
     group.attrs["spatialdata_attrs"] = attrs
-
-
-def _iter_multiscale(
-    data: DataTree,
-    attr: str | None,
-) -> list[Any]:
-    # TODO: put this check also in the validator for raster multiscales
-    for i in data:
-        variables = set(data[i].variables.keys())
-        names: set[str] = variables.difference({"c", "z", "y", "x"})
-        if len(names) != 1:
-            raise ValueError(f"Invalid variable name: `{names}`.")
-    name: str = next(iter(names))
-    if attr is not None:
-        return [getattr(data[i][name], attr) for i in data]
-    return [data[i][name] for i in data]
 
 
 class dircmp(filecmp.dircmp):  # type: ignore[type-arg]
@@ -238,7 +235,7 @@ def get_dask_backing_files(element: SpatialData | SpatialElement | AnnData) -> l
 def _(element: SpatialData) -> list[str]:
     files: set[str] = set()
     for e in element._gen_spatial_element_values():
-        if isinstance(e, (DataArray, DataTree, DaskDataFrame)):
+        if isinstance(e, DataArray | DataTree | DaskDataFrame):
             files = files.union(get_dask_backing_files(e))
     return list(files)
 
@@ -250,8 +247,8 @@ def _(element: DataArray) -> list[str]:
 
 @get_dask_backing_files.register(DataTree)
 def _(element: DataTree) -> list[str]:
-    xdata0 = next(iter(iterate_pyramid_levels(element)))
-    return _get_backing_files(xdata0.data)
+    dask_data_scale0 = get_pyramid_levels(element, attr="data", n=0)
+    return _get_backing_files(dask_data_scale0)
 
 
 @get_dask_backing_files.register(DaskDataFrame)
@@ -391,52 +388,57 @@ def save_transformations(sdata: SpatialData) -> None:
     sdata.write_transformations()
 
 
-def read_table_and_validate(
-    zarr_store_path: str, group: zarr.Group, subgroup: zarr.Group, tables: dict[str, AnnData]
-) -> dict[str, AnnData]:
+class BadFileHandleMethod(Enum):
+    ERROR = "error"
+    WARN = "warn"
+
+
+@contextmanager
+def handle_read_errors(
+    on_bad_files: Literal[BadFileHandleMethod.ERROR, BadFileHandleMethod.WARN],
+    location: str,
+    exc_types: tuple[type[Exception], ...],
+) -> Generator[None, None, None]:
     """
-    Read in tables in the tables Zarr.group of a SpatialData Zarr store.
+    Handle read errors according to parameter `on_bad_files`.
 
     Parameters
     ----------
-    zarr_store_path
-        The path to the Zarr store.
-    group
-        The parent group containing the subgroup.
-    subgroup
-        The subgroup containing the tables.
-    tables
-        A dictionary of tables.
+    on_bad_files
+        Specifies what to do upon encountering an exception.
+        Allowed values are :
 
-    Returns
-    -------
-    The modified dictionary with the tables.
+        - 'error', let the exception be raised.
+        - 'warn', convert the exception into a warning if it is one of the expected exception types.
+    location
+        String identifying the function call where the exception happened
+    exc_types
+        A tuple of expected exception classes that should be converted into warnings.
+
+    Raises
+    ------
+    If `on_bad_files="error"`, all encountered exceptions are raised.
+    If `on_bad_files="warn"`, any encountered exceptions not matching the `exc_types` are raised.
     """
-    count = 0
-    for table_name in subgroup:
-        f_elem = subgroup[table_name]
-        f_elem_store = os.path.join(zarr_store_path, f_elem.path)
-        if isinstance(group.store, zarr.storage.ConsolidatedMetadataStore):
-            tables[table_name] = read_elem(f_elem)
-            # we can replace read_elem with read_anndata_zarr after this PR gets into a release (>= 0.6.5)
-            # https://github.com/scverse/anndata/pull/1057#pullrequestreview-1530623183
-            # table = read_anndata_zarr(f_elem)
-        else:
-            tables[table_name] = read_anndata_zarr(f_elem_store)
-        if TableModel.ATTRS_KEY in tables[table_name].uns:
-            # fill out eventual missing attributes that has been omitted because their value was None
-            attrs = tables[table_name].uns[TableModel.ATTRS_KEY]
-            if "region" not in attrs:
-                attrs["region"] = None
-            if "region_key" not in attrs:
-                attrs["region_key"] = None
-            if "instance_key" not in attrs:
-                attrs["instance_key"] = None
-            # fix type for region
-            if "region" in attrs and isinstance(attrs["region"], np.ndarray):
-                attrs["region"] = attrs["region"].tolist()
-
-        count += 1
-
-    logger.debug(f"Found {count} elements in {subgroup}")
-    return tables
+    on_bad_files = BadFileHandleMethod(on_bad_files)  # str to enum
+    if on_bad_files == BadFileHandleMethod.WARN:
+        try:
+            yield
+        except exc_types as e:
+            # Extract the original filename and line number from the exception and
+            # create a warning from it.
+            exc_traceback = sys.exc_info()[-1]
+            last_frame, lineno = list(traceback.walk_tb(exc_traceback))[-1]
+            filename = last_frame.f_code.co_filename
+            # Include the location (element path) in the warning message.
+            message = f"{location}: {e.__class__.__name__}: {e.args[0]}"
+            warnings.warn_explicit(
+                message=message,
+                category=UserWarning,
+                filename=filename,
+                lineno=lineno,
+            )
+            # continue
+    else:  # on_bad_files == BadFileHandleMethod.ERROR
+        # Let it raise exceptions
+        yield
