@@ -65,6 +65,7 @@ def get_element_annotators(sdata: SpatialData, element_name: str) -> set[str]:
 def get_element_instances(
     element: SpatialElement,
     return_background: bool = False,
+    background_label: int = 0,
 ) -> pd.Index:
     """
     Get the instances (index values) of the SpatialElement.
@@ -74,7 +75,10 @@ def get_element_instances(
     element
         The SpatialElement.
     return_background
-        If True, the background label (0) is included in the output.
+        If True, the background label is included in the output.
+    background_label
+        The label value to treat as background when ``return_background`` is False.
+        Defaults to 0.
 
     Returns
     -------
@@ -88,6 +92,7 @@ def get_element_instances(
 def _(
     element: DataArray | DataTree,
     return_background: bool = False,
+    background_label: int = 0,
 ) -> pd.Index:
     model = get_model(element)
     if model not in [Labels2DModel, Labels3DModel]:
@@ -105,9 +110,8 @@ def _(
         # can be slow
         instances = da.unique(xdata.data).compute()
     index: pd.Index = pd.Index(np.sort(instances))
-    if not return_background and 0 in index:
-        without_background: pd.Index = index.drop([0])  # drop the background label
-        return without_background
+    if not return_background and background_label in index:
+        return index.drop(background_label)  # drop the background label
     return index
 
 
@@ -267,6 +271,7 @@ def _right_exclusive_join_spatialelement_table(
     table: AnnData,
     match_rows: Literal["left", "no", "right"],
     filter_label_pixels: bool | None = None,
+    background_label: int = 0,
 ) -> tuple[dict[str, Any], AnnData | None]:
     if match_rows == "left":
         warnings.warn(
@@ -294,7 +299,7 @@ def _right_exclusive_join_spatialelement_table(
                 if element_type in ["points", "shapes"]:
                     element_indices = element.index
                 else:
-                    element_indices = get_element_instances(element)
+                    element_indices = get_element_instances(element, background_label=background_label)
                 submask = ~table_instance_key_column.isin(element_indices)
                 keep[group_df.index[submask.to_numpy()]] = True
                 has_match = True
@@ -490,6 +495,7 @@ def _left_join_spatialelement_table(
     table: AnnData,
     match_rows: Literal["left", "no", "right"],
     filter_label_pixels: bool | None = None,
+    background_label: int = 0,
 ) -> tuple[dict[str, Any], AnnData | None]:
     if match_rows == "right":
         warnings.warn(
@@ -515,7 +521,7 @@ def _left_join_spatialelement_table(
                 if element_type in ["points", "shapes"]:
                     element_indices = element.index
                 else:
-                    element_indices = get_element_instances(element)
+                    element_indices = get_element_instances(element, background_label=background_label)
 
                 joined_indices = _get_joined_table_indices(
                     joined_indices, element_indices, table_instance_key_column, match_rows
@@ -635,6 +641,7 @@ def join_spatialelement_table(
     how: Literal["left", "left_exclusive", "inner", "right", "right_exclusive"] = "left",
     match_rows: Literal["no", "left", "right"] = "no",
     filter_label_pixels: bool | None = None,
+    background_label: int = 0,
 ) -> tuple[dict[str, Any], AnnData | None]:
     """
     Join SpatialElement(s) and table together in SQL like manner.
@@ -654,7 +661,7 @@ def join_spatialelement_table(
 
     For Points and Shapes elements every valid join for argument how is supported. For Labels elements only
     the ``'left'`` and ``'right_exclusive'`` joins are supported.
-    For Labels, the background label (0) is not included in the output and it will not be returned.
+    For Labels, the background label is not included in the output and it will not be returned.
 
     Parameters
     ----------
@@ -683,6 +690,8 @@ def join_spatialelement_table(
         If ``True``, pixels whose instance id is not present in the table are set to zero.
         If ``None`` (default), label elements are returned unfiltered and a warning is issued.
         If ``False``, label elements are returned unfiltered silently (no warning).
+    background_label
+        The label value to treat as background when joining Labels elements. Defaults to 0.
 
     Returns
     -------
@@ -761,7 +770,9 @@ def join_spatialelement_table(
                 elements_dict[element_type][name] = element
 
     assert table is not None
-    elements_dict_joined, table = _call_join(elements_dict, table, how, match_rows, filter_label_pixels)
+    elements_dict_joined, table = _call_join(
+        elements_dict, table, how, match_rows, filter_label_pixels, background_label
+    )
     return elements_dict_joined, table
 
 
@@ -771,6 +782,7 @@ def _call_join(
     how: str,
     match_rows: Literal["no", "left", "right"],
     filter_label_pixels: bool | None = None,
+    background_label: int = 0,
 ) -> tuple[dict[str, Any], AnnData | None]:
     assert any(key in elements_dict for key in ["labels", "shapes", "points"]), (
         "No valid element to join in spatial_element_name. Must provide at least one of either `labels`, `points` or "
@@ -785,7 +797,11 @@ def _call_join(
     # if how in JoinTypes.__dict__["_member_names_"]:
     # hotfix for bug with Python 3.13:
     if how in JoinTypes.__dict__:
-        elements_dict, table = getattr(JoinTypes, how)(elements_dict, table, match_rows, filter_label_pixels)
+        join = getattr(JoinTypes, how)
+        if how in ["left", "right_exclusive"]:
+            elements_dict, table = join(elements_dict, table, match_rows, filter_label_pixels, background_label)
+        else:
+            elements_dict, table = join(elements_dict, table, match_rows, filter_label_pixels)
     else:
         raise TypeError(f"`{how}` is not a valid type of join.")
 
@@ -795,7 +811,9 @@ def _call_join(
     return elements_dict, table
 
 
-def match_table_to_element(sdata: SpatialData, element_name: str, table_name: str = "table") -> AnnData:
+def match_table_to_element(
+    sdata: SpatialData, element_name: str, table_name: str = "table", background_label: int = 0
+) -> AnnData:
     """
     Filter the table and reorders the rows to match the instances (rows/labels) of the specified SpatialElement.
 
@@ -807,6 +825,8 @@ def match_table_to_element(sdata: SpatialData, element_name: str, table_name: st
         The name of the spatial elements to be joined with the table.
     table_name
         The name of the table to match to the element.
+    background_label
+        The label value to treat as background when matching a Labels element. Defaults to 0.
 
     Returns
     -------
@@ -823,7 +843,12 @@ def match_table_to_element(sdata: SpatialData, element_name: str, table_name: st
     join_spatialelement_table : General function, to join spatial elements with a table with more control.
     """
     _, matched_table = join_spatialelement_table(
-        sdata=sdata, spatial_element_names=element_name, table_name=table_name, how="left", match_rows="left"
+        sdata=sdata,
+        spatial_element_names=element_name,
+        table_name=table_name,
+        how="left",
+        match_rows="left",
+        background_label=background_label,
     )
     if matched_table is None:
         raise ValueError(f"No rows of table {table_name!r} match element {element_name!r}.")
@@ -1074,6 +1099,7 @@ def get_values(
     table_name: str | None = None,
     table_layer: str | None = None,
     return_obsm_as_is: bool = False,
+    background_label: int = 0,
 ) -> pd.DataFrame | ArrayLike:
     """
     Get the values from the element, from any location: df columns, obs or var columns (table).
@@ -1097,6 +1123,8 @@ def get_values(
     return_obsm_as_is
         In case the value is in obsm the value of the key can be returned as is if return_obsm_as_is is True, otherwise
         creates a dataframe and returns it.
+    background_label
+        The label value to treat as background when retrieving values for a Labels element. Defaults to 0.
 
     Returns
     -------
@@ -1105,7 +1133,8 @@ def get_values(
     Notes
     -----
     - The index of the returned dataframe is the instance_key of the table for the specified element.
-    - If the element is a labels, the eventual background (0) is not included in the dataframe of returned values.
+    - If the element is a labels, the eventual background (``background_label``) is not included in the dataframe of
+      returned values.
     """
     el = _get_element(element=element, sdata=sdata, element_name=element_name)
     value_keys = [value_key] if isinstance(value_key, str) else value_key
@@ -1148,7 +1177,12 @@ def get_values(
     if (sdata is not None and table_name is not None) or isinstance(element, AnnData):
         if sdata is not None and table_name is not None:
             assert element_name is not None
-            matched_table = match_table_to_element(sdata=sdata, element_name=element_name, table_name=table_name)
+            matched_table = match_table_to_element(
+                sdata=sdata,
+                element_name=element_name,
+                table_name=table_name,
+                background_label=background_label,
+            )
             region_key = matched_table.uns[TableModel.ATTRS_KEY][TableModel.REGION_KEY_KEY]
             instance_key = matched_table.uns[TableModel.ATTRS_KEY][TableModel.INSTANCE_KEY]
             obs = matched_table.obs
