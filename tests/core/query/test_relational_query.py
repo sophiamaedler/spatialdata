@@ -14,7 +14,7 @@ from spatialdata._core.query.relational_query import (
     get_element_annotators,
     join_spatialelement_table,
 )
-from spatialdata.models.models import TableModel
+from spatialdata.models.models import Labels2DModel, TableModel
 from spatialdata.testing import assert_anndata_equal, assert_geodataframe_equal
 
 
@@ -26,6 +26,37 @@ def test_match_table_to_element(sdata_query_aggregation):
     assert matched_table.obs.index.tolist() == list(reversed(matched_table_reversed.obs.index.tolist()))
 
     # TODO: add tests for labels
+
+
+def test_relational_helpers_accept_custom_label_background():
+    labels = Labels2DModel.parse(np.array([[3, 0], [1, 2]], dtype=np.int32), dims=["y", "x"])
+    table = TableModel.parse(
+        AnnData(
+            obs=pd.DataFrame(
+                {
+                    "region": ["labels"] * 3,
+                    "instance_id": [0, 1, 2],
+                    "domain": pd.Categorical(["zero", "one", "two"]),
+                }
+            ),
+        ),
+        region="labels",
+        region_key="region",
+        instance_key="instance_id",
+    )
+    sdata = SpatialData(labels={"labels": labels}, tables={"table": table})
+
+    matched_table = match_table_to_element(sdata, "labels", "table", background_label=3)
+    assert matched_table.obs["instance_id"].tolist() == [0, 1, 2]
+
+    values = get_values(
+        "domain",
+        sdata=sdata,
+        element_name="labels",
+        table_name="table",
+        background_label=3,
+    )
+    assert values.index.tolist() == [0, 1, 2]
 
 
 def test_join_using_string_instance_id_and_index(sdata_query_aggregation):
